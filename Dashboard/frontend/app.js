@@ -26,10 +26,13 @@ const els = {
   chartEmpty: document.getElementById("chart-empty"),
   chartNode: document.getElementById("chart-node"),
   chartSeq: document.getElementById("chart-seq"),
+  chartLegend: document.getElementById("chart-legend"),
   updatedAt: document.getElementById("updated-at"),
   chartTable: document.getElementById("chart-table"),
   eventLog: document.getElementById("event-log"),
   logEmpty: document.getElementById("log-empty"),
+  chatSidebar: document.getElementById("chat-sidebar"),
+  chatContextNode: document.getElementById("chat-context-node"),
   chatBlock: document.getElementById("chat-block"),
   aiModelTag: document.getElementById("ai-model-tag"),
   chatClearBtn: document.getElementById("chat-clear-btn"),
@@ -57,6 +60,7 @@ const state = {
   wsOpen: false,
   chatHistory: [],
   chatLoading: false,
+  chatScope: "selected",
 };
 
 /* ---------- helpers ---------- */
@@ -98,12 +102,21 @@ function rssiLevel(dbm) {
   if (dbm > -82) return 2;
   return 1;
 }
+function escapeHtml(str) {
+  if (str === null || str === undefined) return "";
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
 
 function pushLog(kind, nodeId, text) {
   if (els.logEmpty && els.logEmpty.isConnected) els.logEmpty.remove();
   const li = document.createElement("li");
   if (kind === "dropped") li.dataset.kind = "dropped";
-  li.innerHTML = `<b>${nodeId}</b><span>${new Date().toLocaleTimeString()} · ${text}</span>`;
+  li.innerHTML = `<b>${escapeHtml(nodeId)}</b><span>${new Date().toLocaleTimeString()} · ${escapeHtml(text)}</span>`;
   els.eventLog.prepend(li);
   while (els.eventLog.children.length > MAX_LOG) els.eventLog.lastChild.remove();
 }
@@ -142,9 +155,16 @@ function renderStatus() {
 
 function upsertNode(node) {
   if (!node || !node.nodeId) return;
-  state.nodes.set(node.nodeId, { ...(state.nodes.get(node.nodeId) || {}), ...node });
+  const prev = state.nodes.get(node.nodeId) || {};
+  const mergedPayload = { ...(prev.payload || {}), ...(node.payload || {}) };
+  const mergedUnits = { ...(prev.units || {}), ...(node.units || {}) };
+  state.nodes.set(node.nodeId, {
+    ...prev,
+    ...node,
+    payload: mergedPayload,
+    units: mergedUnits,
+  });
 }
-
 function nodeSnapshot(id) {
   const node = state.nodes.get(id);
   const samples = state.samples.get(id) || [];
@@ -155,7 +175,17 @@ function renderRoster() {
   const nodes = [...state.nodes.values()].sort((a, b) => a.nodeId.localeCompare(b.nodeId));
   els.railCount.textContent = String(nodes.length);
   if (els.railEmpty.isConnected) els.railEmpty.style.display = nodes.length ? "none" : "";
-  els.stationList.querySelectorAll(".station-row").forEach((el) => el.remove());
+
+  const currentIds = new Set(nodes.map((n) => n.nodeId));
+  const existingRows = new Map();
+  els.stationList.querySelectorAll(".station-row").forEach((el) => {
+    const id = el.dataset.nodeId;
+    if (id && currentIds.has(id)) {
+      existingRows.set(id, el);
+    } else {
+      el.remove();
+    }
+  });
 
   for (const node of nodes) {
     const age = ageSeconds(node.timestamp);
@@ -163,14 +193,22 @@ function renderRoster() {
     const hasRssi = node.rssi !== null && node.rssi !== undefined && Number.isFinite(Number(node.rssi));
     const rssi = hasRssi ? Number(node.rssi) : NaN;
     const bat = Number(node.batteryLevel);
-
-    const row = document.createElement("button");
-    row.type = "button";
-    row.className = "station-row";
+    const isSelected = String(node.nodeId === state.selected);
     const srcText = node.rssiSourceNodeId ? ` via ${node.rssiSourceNodeId}` : "";
+
+    let row = existingRows.get(node.nodeId);
+    if (!row) {
+      row = document.createElement("button");
+      row.type = "button";
+      row.className = "station-row";
+      row.dataset.nodeId = node.nodeId;
+      row.addEventListener("click", () => selectStation(node.nodeId));
+      els.stationList.appendChild(row);
+    }
+
     row.title = `${node.nodeId} — ${st}${srcText}`;
-    row.dataset.selected = String(node.nodeId === state.selected);
-    row.setAttribute("aria-pressed", row.dataset.selected);
+    row.dataset.selected = isSelected;
+    row.setAttribute("aria-pressed", isSelected);
     row.innerHTML = `
       <span class="station-id">${node.nodeId}</span>
       <span class="station-meta">
@@ -182,9 +220,15 @@ function renderRoster() {
         <span>bat ${Number.isFinite(bat) ? `${Math.round(bat)}%` : "—"}</span>
       </span>
       <span class="station-age" data-state="${st}">${ageText(age)}</span>`;
-    row.addEventListener("click", () => selectStation(node.nodeId));
-    els.stationList.appendChild(row);
   }
+}
+
+function formatMetricLabel(key) {
+  const lower = key.toLowerCase();
+  if (lower.includes("temp")) return "Temperature";
+  if (lower.includes("hum")) return "Humidity";
+  if (lower.includes("ldr")) return "Light (LDR)";
+  return key;
 }
 
 function metricCards(values, node) {
@@ -192,19 +236,19 @@ function metricCards(values, node) {
   const cards = [];
   const units = (node && node.units) || {};
 
-  // Check known metrics first
-  for (const m of METRICS) {
-    const v = payload[m.key];
-    if (!Number.isFinite(Number(v))) continue;
-    cards.push({ label: m.label, unit: units[m.key] || m.unit, decimals: m.decimals, value: Number(v) });
-  }
-
-  // Generic numeric keys from payload beyond the known pair
   for (const [k, v] of Object.entries(payload)) {
-    if (METRICS.some((m) => m.key === k) || !Number.isFinite(Number(v)) || cards.length >= 4) continue;
-    cards.push({ label: k, unit: units[k] || "", decimals: 1, value: Number(v) });
+    if (!Number.isFinite(Number(v)) || cards.length >= 4) continue;
+    const lower = k.toLowerCase();
+    const label = formatMetricLabel(k);
+    let unit = units[k] || "";
+    if (!unit) {
+      if (lower.includes("temp")) unit = "°C";
+      else if (lower.includes("hum")) unit = "%";
+      else if (lower.includes("ldr")) unit = "adc";
+    }
+    const decimals = lower.includes("hum") || lower.includes("ldr") ? 0 : 1;
+    cards.push({ label, unit, decimals, value: Number(v), key: k });
   }
-
   // Authoritative signal metric: "LAST-HOP RSSI"
   const hasRssi = node && node.rssi !== null && node.rssi !== undefined && Number.isFinite(Number(node.rssi));
   if (hasRssi) {
@@ -255,8 +299,50 @@ function renderMetrics() {
     return;
   }
 
-  const ageLine = (t) =>
-    t ? `${fmtClock(t)} · ${st === "stale" ? "not reporting, last seen " + ageText(age) : ageText(age)}` : "no data";
+  const ageLine =
+    ts ? `${fmtClock(ts)} · ${st === "stale" ? "not reporting, last seen " + ageText(age) : ageText(age)}` : "no data";
+
+  const existingCards = els.metricGrid.querySelectorAll(".metric-primary, .metric-cell");
+  if (existingCards.length === cards.length) {
+    let structureMatches = true;
+    for (let i = 0; i < cards.length; i++) {
+      const cardEl = existingCards[i];
+      const labelEl = cardEl.querySelector(".metric-label");
+      if (!labelEl || labelEl.textContent !== cards[i].label) {
+        structureMatches = false;
+        break;
+      }
+    }
+    if (structureMatches) {
+      for (let i = 0; i < cards.length; i++) {
+        const c = cards[i];
+        const cardEl = existingCards[i];
+        cardEl.dataset.stale = String(st === "stale");
+        const tag = cardEl.querySelector(".tag");
+        if (tag) {
+          tag.dataset.state = st;
+          tag.textContent = st.toUpperCase();
+        }
+        const valEl = cardEl.querySelector(".metric-value");
+        if (valEl) {
+          if (c.text) {
+            valEl.className = "metric-value text-val";
+            valEl.textContent = c.text;
+          } else {
+            valEl.className = "metric-value";
+            valEl.textContent = Number.isFinite(c.value) ? c.value.toFixed(c.decimals) : "--";
+          }
+        }
+        const unitEl = cardEl.querySelector(".metric-unit");
+        if (unitEl) unitEl.textContent = c.unit || "";
+        const subEl = cardEl.querySelector(".metric-sub");
+        if (subEl) subEl.textContent = c.sub || "";
+        const ageEl = cardEl.querySelector(".metric-age");
+        if (ageEl) ageEl.textContent = ageLine;
+      }
+      return;
+    }
+  }
 
   const cell = (c, primary) => {
     const valHtml = c.text
@@ -274,7 +360,7 @@ function renderMetrics() {
         ${c.unit ? `<span class="metric-unit">${c.unit}</span>` : ""}
       </div>
       ${subHtml}
-      <span class="metric-age">${ageLine(ts)}</span>
+      <span class="metric-age">${ageLine}</span>
     </div>`;
   };
 
@@ -326,15 +412,38 @@ function chartSize() {
   return { w: cssW, h: cssH };
 }
 
-function niceTicks(min, max, n) {
-  const span = Math.max(1e-9, max - min);
-  const rawStep = span / n;
+function calculateNiceScale(minVal, maxVal, targetTicks = 4, clampZero = true) {
+  if (!Number.isFinite(minVal) || !Number.isFinite(maxVal)) {
+    return [0, 25, 50, 75, 100];
+  }
+  if (Math.abs(maxVal - minVal) < 1e-6) {
+    minVal = minVal - 2.0;
+    maxVal = maxVal + 2.0;
+  }
+
+  const span = maxVal - minVal;
+  const paddedMax = maxVal + span * 0.15;
+  const paddedMin = clampZero && minVal >= 0 ? Math.max(0, minVal - span * 0.08) : minVal - span * 0.08;
+
+  const rawStep = Math.max(1e-6, (paddedMax - paddedMin) / targetTicks);
   const mag = Math.pow(10, Math.floor(Math.log10(rawStep)));
   const err = rawStep / mag;
   const mult = err >= 7.5 ? 10 : err >= 3.5 ? 5 : err >= 1.5 ? 2 : 1;
   const step = mag * mult;
+
+  let firstTick = Math.floor(paddedMin / step) * step;
+  if (clampZero && minVal >= 0 && firstTick < 0) {
+    firstTick = 0;
+  }
+  let lastTick = Math.ceil(paddedMax / step) * step;
+
   const ticks = [];
-  for (let v = Math.floor(min / step) * step; v <= max + step / 2; v += step) ticks.push(v);
+  for (let v = firstTick; v <= lastTick + step * 0.01; v += step) {
+    ticks.push(Number(v.toFixed(6)));
+  }
+  if (ticks.length > 0 && ticks[ticks.length - 1] < maxVal) {
+    ticks.push(Number((ticks[ticks.length - 1] + step).toFixed(6)));
+  }
   return ticks;
 }
 
@@ -347,11 +456,8 @@ function medianInterval(samples) {
 }
 
 function chartKeys(samples) {
-  const known = METRICS.filter((m) => samples.some((s) => Number.isFinite(s[m.key])));
-  if (known.length) return known;
-
-  const found = new Set();
   const metaUnits = (state.nodes.get(state.selected) || {}).units || {};
+  const found = new Set();
   for (const s of samples) {
     for (const [k, v] of Object.entries(s)) {
       if (!["__t", "timestamp", "sequence", "bootId", "rssi", "rssiSourceNodeId", "hops", "units"].includes(k) && Number.isFinite(v)) {
@@ -359,16 +465,46 @@ function chartKeys(samples) {
       }
     }
   }
-  return Array.from(found).slice(0, 2).map((k, idx) => ({
-    key: k,
-    label: k,
-    unit: metaUnits[k] || "",
-    decimals: 1,
-    axis: idx === 0 ? "left" : "right",
-  }));
+
+  const sorted = Array.from(found).sort((a, b) => {
+    const aLower = a.toLowerCase();
+    const bLower = b.toLowerCase();
+    const aIsTemp = aLower.includes("temp");
+    const bIsTemp = bLower.includes("temp");
+    if (aIsTemp && !bIsTemp) return -1;
+    if (!aIsTemp && bIsTemp) return 1;
+    const aIsHum = aLower.includes("hum");
+    const bIsHum = bLower.includes("hum");
+    if (aIsHum && !bIsHum) return -1;
+    if (!aIsHum && bIsHum) return 1;
+    return a.localeCompare(b);
+  });
+
+  return sorted.slice(0, 2).map((k, idx) => {
+    if (k.toLowerCase().includes("temp")) defaultUnit = "°C";
+    else if (k.toLowerCase().includes("hum")) defaultUnit = "%";
+    else if (k.toLowerCase().includes("ldr")) defaultUnit = "adc";
+
+    return {
+      key: k,
+      label: formatMetricLabel(k),
+      rawKey: k,
+      unit: metaUnits[k] || defaultUnit,
+      decimals: k.toLowerCase().includes("hum") ? 0 : 1,
+      axis: idx === 1 ? "right" : "left",
+    };
+  });
 }
 
 const GAP_FACTOR = 3;
+let chartRaf = null;
+function scheduleChartDraw() {
+  if (chartRaf) return;
+  chartRaf = requestAnimationFrame(() => {
+    chartRaf = null;
+    drawChart();
+  });
+}
 
 function drawChart() {
   const { w, h } = chartSize();
@@ -377,9 +513,12 @@ function drawChart() {
   const samples = state.samples.get(state.selected) || [];
   els.chartNode.textContent = state.selected || "station";
   els.chartEmpty.style.display = samples.length ? "none" : "flex";
-  if (!samples.length) return;
+  if (!samples.length) {
+    if (els.chartLegend) els.chartLegend.replaceChildren();
+    return;
+  }
 
-  const pad = { l: 46, r: 48, t: 22, b: 28 };
+  const pad = { l: 48, r: 48, t: 28, b: 26 };
   const lo = samples[0].__t;
   const hi = samples[samples.length - 1].__t;
   const span = Math.max(3000, hi - lo);
@@ -388,8 +527,12 @@ function drawChart() {
   const med = medianInterval(samples);
 
   const grid = token("--line", "#2e3237");
-  const faint = token("--text-faint", "#6e6d64");
-  const seriesColors = [token("--color-series-temp", "#ffb454"), token("--color-series-humidity", "#a8a69b")];
+  const faint = token("--text-faint", "#8a897f");
+  const seriesColors = [
+    token("--color-series-temp", "#ffb454"),
+    token("--color-series-humidity", "#a8a69b"),
+    token("--live", "#6fbf73"),
+  ];
   const fontStack = token("--font-mono", "monospace");
   cctx.font = "10px " + fontStack;
   cctx.lineWidth = 1;
@@ -410,15 +553,29 @@ function drawChart() {
 
   const keys = chartKeys(samples);
 
+  if (els.chartLegend) {
+    els.chartLegend.innerHTML = keys
+      .map((m, ki) => {
+        const color = seriesColors[ki] || seriesColors[0];
+        return `<span class="legend-item"><i class="legend-swatch" style="background:${color}"></i><span>${m.label}${m.unit ? ` (${m.unit})` : ""}</span></span>`;
+      })
+      .join("");
+  }
+
   keys.forEach((m, ki) => {
     const fs = samples.filter((s) => Number.isFinite(s[m.key]));
-    const vMax = Math.max(...fs.map((s) => s[m.key]));
-    const ticks = ki === 0 ? niceTicks(0, Math.max(vMax, 10) * 1.05, 4) : niceTicks(0, 100, 4);
+    if (!fs.length) return;
+    const vals = fs.map((s) => s[m.key]);
+    const vMin = Math.min(...vals);
+    const vMax = Math.max(...vals);
+    const isPercent = m.unit && m.unit.includes("%");
+    const ticks = calculateNiceScale(vMin, vMax, 4, isPercent || vMin >= 0);
     const vmin = ticks[0];
     const vmax = ticks[ticks.length - 1];
     const vToY = (v) => h - pad.b - ((v - vmin) / Math.max(1e-9, vmax - vmin)) * (h - pad.t - pad.b);
     const axX = ki === 0 ? pad.l : w - pad.r;
 
+    // Gridlines drawn once using primary metric (ki === 0)
     if (ki === 0) {
       cctx.strokeStyle = token("--line-strong", "#4a4f55");
       ticks.forEach((t) => {
@@ -430,30 +587,36 @@ function drawChart() {
       });
     }
 
-    // axis ticks + unit label
-    cctx.fillStyle = faint;
-    cctx.strokeStyle = grid;
-    cctx.beginPath();
-    cctx.moveTo(axX, pad.t);
-    cctx.lineTo(axX, h - pad.b);
-    cctx.stroke();
-    ticks.forEach((t) => {
-      const y = vToY(t);
+    // Draw axis ticks: Left axis for Series 0, Right axis only for Series 1 (avoids collisions if >2 metrics)
+    if (ki === 0 || ki === 1) {
+      cctx.fillStyle = faint;
+      cctx.strokeStyle = grid;
       cctx.beginPath();
-      cctx.moveTo(axX - 2, y);
-      cctx.lineTo(axX + 2, y);
+      cctx.moveTo(axX, pad.t);
+      cctx.lineTo(axX, h - pad.b);
       cctx.stroke();
-      cctx.textAlign = ki === 0 ? "right" : "left";
-      cctx.fillText(String(Number(t.toFixed(1))), ki === 0 ? axX - 6 : axX + 6, y + 3);
-    });
-    cctx.textAlign = ki === 0 ? "left" : "right";
-    cctx.fillText(
-      `${m.label}${m.unit ? ` (${m.unit})` : ""}`,
-      ki === 0 ? pad.l + 8 : w - pad.r - 8,
-      pad.t + 4
-    );
+      ticks.forEach((t) => {
+        const y = vToY(t);
+        cctx.beginPath();
+        cctx.moveTo(axX - 2, y);
+        cctx.lineTo(axX + 2, y);
+        cctx.stroke();
+        cctx.textAlign = ki === 0 ? "right" : "left";
+        cctx.fillText(String(Number(t.toFixed(1))), ki === 0 ? axX - 6 : axX + 6, y + 3);
+      });
 
-    // series line, gaps where the reading is missing or time jumped
+      // Draw axis unit clean above the axis line
+      cctx.fillStyle = seriesColors[ki] || seriesColors[0];
+      cctx.textAlign = ki === 0 ? "right" : "left";
+      cctx.fillText(m.unit || "", ki === 0 ? axX - 6 : axX + 6, pad.t - 8);
+    }
+
+    // Series line strictly clipped inside plot box with headroom
+    cctx.save();
+    cctx.beginPath();
+    cctx.rect(pad.l, pad.t, w - pad.l - pad.r, h - pad.t - pad.b);
+    cctx.clip();
+
     cctx.strokeStyle = seriesColors[ki] || seriesColors[0];
     cctx.lineWidth = 1.75;
     let pen = false;
@@ -484,7 +647,9 @@ function drawChart() {
       }
     }
     cctx.lineWidth = 1;
+    cctx.restore();
   });
+
   if (!keys.length) {
     cctx.fillStyle = faint;
     cctx.textAlign = "center";
@@ -526,7 +691,7 @@ function renderChartTable(samples) {
   tbody.innerHTML = rows.join("");
 }
 
-const resizeObserver = new ResizeObserver(() => drawChart());
+const resizeObserver = new ResizeObserver(() => scheduleChartDraw());
 resizeObserver.observe(els.chartFrame);
 
 /* ---------- automated insights ---------- */
@@ -543,11 +708,12 @@ async function loadInsights(nodeId) {
     return;
   }
 
-  // Clear old-node insight content immediately on selection change
+  const isNodeChange = els.insightsNode.textContent !== nodeId;
   els.insightsNode.textContent = nodeId;
   els.insightsUpdatedAt.textContent = "updating…";
-  els.insightsContent.replaceChildren();
-
+  if (isNodeChange) {
+    els.insightsContent.replaceChildren();
+  }
   let parsed;
   try {
     const res = await fetch(`/nodes/${encodeURIComponent(nodeId)}/insights`);
@@ -592,10 +758,15 @@ async function loadInsights(nodeId) {
   }
 
   if (count < 20) {
-    const note = document.createElement("p");
-    note.className = "empty-note";
-    note.textContent = `Collecting baseline: ${count}/20 valid samples.`;
-    els.insightsContent.replaceChildren(note);
+    const existingNote = els.insightsContent.querySelector(".empty-note");
+    if (existingNote) {
+      existingNote.textContent = `Collecting baseline: ${count}/20 valid samples.`;
+    } else {
+      const note = document.createElement("p");
+      note.className = "empty-note";
+      note.textContent = `Collecting baseline: ${count}/20 valid samples.`;
+      els.insightsContent.replaceChildren(note);
+    }
     return;
   }
 
@@ -642,10 +813,9 @@ function scheduleInsightsUpdate(nodeId) {
 /* ---------- stations switching + history ---------- */
 
 function applyStation() {
-  renderRoster();
   renderMetrics();
   const cached = state.samples.get(state.selected) || [];
-  drawChart();
+  scheduleChartDraw();
   renderChartTable(cached);
 
   const { node, last } = nodeSnapshot(state.selected);
@@ -658,8 +828,10 @@ function applyStation() {
 function selectStation(id) {
   if (state.selected === id) return;
   state.selected = id;
-
-  // Clear old-node insight content immediately on selection change
+  if (els.chatContextNode) {
+    els.chatContextNode.textContent = state.chatScope === "all" ? "ALL STATIONS" : (id || "ALL STATIONS");
+  }
+  renderRoster();
   els.insightsContent.replaceChildren();
   els.insightsNode.textContent = id;
   els.insightsUpdatedAt.textContent = "updating…";
@@ -825,6 +997,7 @@ function onTelemetry(msg) {
   renderHealth();
   if (!state.selected) {
     state.selected = msg.nodeId;
+    if (els.chatContextNode) els.chatContextNode.textContent = state.selected;
     applyStation();
     loadInsights(state.selected);
   } else if (msg.nodeId === state.selected) {
@@ -866,15 +1039,34 @@ function appendChatMessage(role, text) {
   const msg = document.createElement("div");
   msg.className = `chat-msg chat-msg-${role}`;
 
+  const header = document.createElement("div");
+  header.className = "chat-msg-header";
+
   const roleLabel = document.createElement("span");
   roleLabel.className = "chat-role";
   roleLabel.textContent = role === "user" ? "[USER]" : "[AI]";
+  header.appendChild(roleLabel);
 
-  const textSpan = document.createElement("span");
+  if (role === "assistant" && text && !text.includes("thinking…")) {
+    const copyBtn = document.createElement("button");
+    copyBtn.type = "button";
+    copyBtn.className = "copy-btn";
+    copyBtn.textContent = "COPY";
+    copyBtn.title = "Copy message to clipboard";
+    copyBtn.addEventListener("click", () => {
+      navigator.clipboard.writeText(text).then(() => {
+        copyBtn.textContent = "COPIED";
+        setTimeout(() => { copyBtn.textContent = "COPY"; }, 1500);
+      });
+    });
+    header.appendChild(copyBtn);
+  }
+
+  const textSpan = document.createElement("div");
   textSpan.className = "chat-text";
   textSpan.textContent = text;
 
-  msg.appendChild(roleLabel);
+  msg.appendChild(header);
   msg.appendChild(textSpan);
   els.chatMessages.appendChild(msg);
   els.chatMessages.scrollTop = els.chatMessages.scrollHeight;
@@ -923,7 +1115,7 @@ async function sendChatMessage(promptText) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         message: text,
-        nodeId: state.selected || null,
+        nodeId: state.chatScope === "all" ? null : (state.selected || null),
         history: state.chatHistory.slice(0, -1).slice(-8),
       }),
     });
@@ -967,6 +1159,19 @@ function initChatEvents() {
         els.chatMessages.replaceChildren();
         appendChatMessage("assistant", "Chat history cleared. Ready for your questions.");
       }
+    });
+  }
+  if (els.chatContextNode) {
+    els.chatContextNode.title = "Click to toggle between active station and all-stations mesh summary";
+    els.chatContextNode.addEventListener("click", () => {
+      state.chatScope = state.chatScope === "all" ? "selected" : "all";
+      els.chatContextNode.textContent = state.chatScope === "all" ? "ALL STATIONS" : (state.selected || "ALL STATIONS");
+      appendChatMessage(
+        "assistant",
+        state.chatScope === "all"
+          ? "Context switched to ALL STATIONS (entire mesh network)."
+          : `Context switched to ${state.selected || "active station"}.`
+      );
     });
   }
 

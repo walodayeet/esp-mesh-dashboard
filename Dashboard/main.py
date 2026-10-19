@@ -235,6 +235,13 @@ async def lifespan(app_inst: FastAPI):
 
 app = FastAPI(title="ESP32 Mesh Dashboard", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
+@app.middleware("http")
+async def add_no_cache_headers(request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/static/") or request.url.path == "/":
+        response.headers["Cache-Control"] = "no-cache, must-revalidate"
+    return response
+
 
 
 @app.get("/")

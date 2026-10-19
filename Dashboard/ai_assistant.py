@@ -95,9 +95,15 @@ def build_grounding_context(receiver: Any, selected_node_id: Optional[str] = Non
             insights_res = calculate_insights(selected_node_id, history, node=selected_node)
             payload = selected_node.get("payload", {})
 
-            # Weather / dew point check if temp and humidity exist
-            temp = payload.get("temperature") or payload.get("temp")
-            hum = payload.get("humidity") or payload.get("hum")
+            # Weather / dew point check if temp and humidity exist (including dotted keys like temp.ambient)
+            temp = None
+            hum = None
+            for k, v in payload.items():
+                k_lower = k.lower()
+                if ("temp" in k_lower or "temperature" in k_lower) and temp is None:
+                    temp = v
+                elif ("hum" in k_lower or "humidity" in k_lower) and hum is None:
+                    hum = v
             weather_analysis = None
             if temp is not None and hum is not None and isinstance(temp, (int, float)) and isinstance(hum, (int, float)):
                 dew_point = calculate_dew_point(float(temp), float(hum))
