@@ -12,6 +12,7 @@ struct MeshMessage
 {
   uint8_t origin[6];      // MAC address of the node that created the message.
   uint8_t destination[6]; // Target MAC, or FF:FF:FF:FF:FF:FF for everyone.
+  uint64_t bootId;        // Per-boot random ID to identify node restart boundaries.
   uint32_t sequence;      // Per-sender number used to recognize repeated packets.
   uint8_t ttl;            // Remaining number of times the packet may be relayed.
   uint8_t hops;           // Number of relays the packet has passed through.
@@ -58,7 +59,8 @@ private:
 
   struct SeenPacket
   {
-    uint8_t origin[6]; // Together with sequence, uniquely identifies a packet.
+    uint8_t origin[6]; // Together with bootId and sequence, uniquely identifies a packet.
+    uint64_t bootId;
     uint32_t sequence;
     bool valid;
   };
@@ -90,6 +92,7 @@ private:
   SeenPacket mSeenPackets[kDuplicateCacheSize];
   size_t mNextSeenPacket;
   uint32_t mNextSequence;
+  uint64_t mBootId;
   uint8_t mMacAddress[6];
   bool mInitialized;
 };

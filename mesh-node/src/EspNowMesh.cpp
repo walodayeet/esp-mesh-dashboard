@@ -4,6 +4,7 @@
 #include <WiFi.h>
 
 #include <cstring>
+#include <esp_random.h>
 #include <esp_wifi.h>
 
 namespace
@@ -40,6 +41,7 @@ EspNowMesh::EspNowMesh()
       mSeenPackets{},
       mNextSeenPacket(0),
       mNextSequence(0),
+      mBootId(0),
       mMacAddress{},
       mInitialized(false) {}
 
@@ -68,21 +70,36 @@ bool EspNowMesh::begin()
   {
     return true;
   }
+  if (mBootId == 0)
+  {
+    mBootId = (static_cast<uint64_t>(esp_random()) << 32) | esp_random();
+    if (mBootId == 0)
+    {
+      mBootId = 1;
+    }
+  }
+
   // The ESP-NOW receive callback has no user-data argument; this stub routes
   // callbacks through one active instance.
   if (mActiveInstance != nullptr && mActiveInstance != this)
   {
+#ifndef MESH_GATEWAY
     Serial.println("EspNowMesh: only one active instance is supported.");
+#endif
     return false;
   }
   if (!WiFi.mode(WIFI_STA))
   {
+#ifndef MESH_GATEWAY
     Serial.println("EspNowMesh: failed to enable Wi-Fi station mode.");
+#endif
     return false;
   }
   if (esp_wifi_get_mac(WIFI_IF_STA, mMacAddress) != ESP_OK)
   {
+#ifndef MESH_GATEWAY
     Serial.println("EspNowMesh: failed to read station MAC address.");
+#endif
     return false;
   }
   wifi_second_chan_t secondaryChannel;
@@ -91,25 +108,33 @@ bool EspNowMesh::begin()
       esp_wifi_get_channel(&primaryChannel, &secondaryChannel);
   if (channelResult != ESP_OK)
   {
+#ifndef MESH_GATEWAY
     Serial.printf("EspNowMesh: failed to read Wi-Fi channel: %s\n",
                   esp_err_to_name(channelResult));
+#endif
     return false;
   }
+#ifndef MESH_GATEWAY
   Serial.printf("EspNowMesh: MAC %02X:%02X:%02X:%02X:%02X:%02X, channel %u\n",
                 mMacAddress[0], mMacAddress[1], mMacAddress[2], mMacAddress[3],
                 mMacAddress[4], mMacAddress[5], primaryChannel);
+#endif
 
   // Keep the radio callback short by processing packets later in update().
   mReceivedQueue =
       xQueueCreate(kReceiveQueueLength, sizeof(ReceivedPacket));
   if (mReceivedQueue == nullptr)
   {
+#ifndef MESH_GATEWAY
     Serial.println("EspNowMesh: failed to create receive queue.");
+#endif
     return false;
   }
   if (esp_now_init() != ESP_OK)
   {
+#ifndef MESH_GATEWAY
     Serial.println("EspNowMesh: ESP-NOW initialization failed.");
+#endif
     vQueueDelete(mReceivedQueue);
     mReceivedQueue = nullptr;
     return false;
@@ -118,7 +143,9 @@ bool EspNowMesh::begin()
   mActiveInstance = this;
   if (esp_now_register_send_cb(&EspNowMesh::onSent) != ESP_OK)
   {
+#ifndef MESH_GATEWAY
     Serial.println("EspNowMesh: failed to register send callback.");
+#endif
     mActiveInstance = nullptr;
     esp_now_deinit();
     vQueueDelete(mReceivedQueue);
@@ -127,7 +154,9 @@ bool EspNowMesh::begin()
   }
   if (esp_now_register_recv_cb(&EspNowMesh::onReceive) != ESP_OK)
   {
+#ifndef MESH_GATEWAY
     Serial.println("EspNowMesh: failed to register receive callback.");
+#endif
     mActiveInstance = nullptr;
     esp_now_unregister_send_cb();
     esp_now_deinit();
@@ -147,7 +176,9 @@ bool EspNowMesh::begin()
   const esp_err_t peerResult = esp_now_add_peer(&broadcastPeer);
   if (peerResult != ESP_OK && peerResult != ESP_ERR_ESPNOW_EXIST)
   {
+#ifndef MESH_GATEWAY
     Serial.printf("EspNowMesh: failed to add broadcast peer: %s\n", esp_err_to_name(peerResult));
+#endif
     esp_now_unregister_recv_cb();
     esp_now_unregister_send_cb();
     mActiveInstance = nullptr;
@@ -207,7 +238,9 @@ void EspNowMesh::update()
       }
       if (!sendPacket(message))
       {
+#ifndef MESH_GATEWAY
         Serial.println("EspNowMesh: failed to relay received message.");
+#endif
       }
     }
   }
@@ -236,6 +269,7 @@ bool EspNowMesh::publishTo(const uint8_t destination[6],
   // Fill in the routing metadata before copying the application payload.
   std::memcpy(message.origin, mMacAddress, sizeof(mMacAddress));
   std::memcpy(message.destination, destination, sizeof(message.destination));
+  message.bootId = mBootId;
   message.sequence = ++mNextSequence;
   message.ttl = kInitialTtl;
   message.payloadLength = length;
@@ -262,8 +296,10 @@ bool EspNowMesh::sendPacket(MeshMessage &message)
       sizeof(message));
   if (result != ESP_OK)
   {
+#ifndef MESH_GATEWAY
     Serial.printf("EspNowMesh: ESP-NOW send failed: %s\n",
                   esp_err_to_name(result));
+#endif
     return false;
   }
   return true;
@@ -272,10 +308,11 @@ bool EspNowMesh::sendPacket(MeshMessage &message)
 // Check the bounded cache for a packet with this origin and sequence number.
 bool EspNowMesh::hasSeen(const MeshMessage &message) const
 {
-  // A packet is considered the same when both its sender and sequence match.
+  // A packet is considered the same when origin, bootId, and sequence match.
   for (const SeenPacket &seen : mSeenPackets)
   {
     if (seen.valid && seen.sequence == message.sequence &&
+        seen.bootId == message.bootId &&
         std::memcmp(seen.origin, message.origin, sizeof(seen.origin)) == 0)
     {
       return true;
@@ -290,6 +327,7 @@ void EspNowMesh::remember(const MeshMessage &message)
   // Replace cache entries in a ring so duplicate tracking uses fixed memory.
   SeenPacket &seen = mSeenPackets[mNextSeenPacket];
   std::memcpy(seen.origin, message.origin, sizeof(seen.origin));
+  seen.bootId = message.bootId;
   seen.sequence = message.sequence;
   seen.valid = true;
   mNextSeenPacket = (mNextSeenPacket + 1) % kDuplicateCacheSize;
@@ -323,7 +361,9 @@ void EspNowMesh::onReceive(const esp_now_recv_info_t *info,
   }
   if (xQueueSend(instance->mReceivedQueue, &packet, 0) != pdTRUE)
   {
+#ifndef MESH_GATEWAY
     Serial.println("EspNowMesh: receive queue full; dropping message.");
+#endif
   }
 }
 

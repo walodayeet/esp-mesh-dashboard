@@ -72,7 +72,7 @@ def test_api_endpoints_expose_latest_node_state():
 
     dashboard = client.get("/")
     assert dashboard.status_code == 200
-    assert "ESP32 Mesh Dashboard" in dashboard.text
+    assert 'id="telemetry-chart"' in dashboard.text
     assert client.get("/static/app.js").status_code == 200
     assert client.get("/static/styles.css").status_code == 200
 

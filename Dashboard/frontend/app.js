@@ -1,214 +1,990 @@
-const statusBadge = document.getElementById("gateway-status");
-const nodeIdEl = document.getElementById("node-id");
-const temperatureEl = document.getElementById("temperature");
-const humidityEl = document.getElementById("humidity");
-const sequenceEl = document.getElementById("sequence");
-const updatedAtEl = document.getElementById("updated-at");
-const messageLogEl = document.getElementById("message-log");
-const chartCanvas = document.getElementById("telemetry-chart");
-const ctx = chartCanvas.getContext("2d");
+/* ESP32 Mesh Telemetry dashboard client.
+   Backend contract: /nodes, /nodes/{id}/history, /nodes/{id}/insights, /health, WS /live.
+   Design rules: DESIGN.md. Chart colours come from the stylesheet tokens, never literals. */
 
-const state = {
-  nodeId: null,
-  samples: [],
-  lastEvent: null,
+const els = {
+  headline: document.getElementById("health-headline"),
+  segs: {
+    live: document.getElementById("hb-live"),
+    warn: document.getElementById("hb-warn"),
+    stale: document.getElementById("hb-stale"),
+  },
+  wsPill: document.getElementById("ws-pill"),
+  gwPill: document.getElementById("gw-pill"),
+  banner: document.getElementById("banner"),
+  bannerText: document.getElementById("banner-text"),
+  metricGrid: document.getElementById("metric-grid"),
+  railCount: document.getElementById("rail-count"),
+  railEmpty: document.getElementById("rail-empty"),
+  stationList: document.getElementById("station-list"),
+  insightsBlock: document.getElementById("insights-block"),
+  insightsNode: document.getElementById("insights-node"),
+  insightsUpdatedAt: document.getElementById("insights-updated-at"),
+  insightsContent: document.getElementById("insights-content"),
+  chartCanvas: document.getElementById("telemetry-chart"),
+  chartFrame: document.getElementById("chart-frame"),
+  chartEmpty: document.getElementById("chart-empty"),
+  chartNode: document.getElementById("chart-node"),
+  chartSeq: document.getElementById("chart-seq"),
+  updatedAt: document.getElementById("updated-at"),
+  chartTable: document.getElementById("chart-table"),
+  eventLog: document.getElementById("event-log"),
+  logEmpty: document.getElementById("log-empty"),
+  chatBlock: document.getElementById("chat-block"),
+  aiModelTag: document.getElementById("ai-model-tag"),
+  chatClearBtn: document.getElementById("chat-clear-btn"),
+  chatMessages: document.getElementById("chat-messages"),
+  chatForm: document.getElementById("chat-form"),
+  chatInput: document.getElementById("chat-input"),
+  chatSendBtn: document.getElementById("chat-send-btn"),
 };
 
-function setStatus(connected) {
-  statusBadge.classList.toggle("connected", connected);
-  statusBadge.classList.toggle("disconnected", !connected);
-  statusBadge.textContent = connected ? "Gateway connected" : "Gateway disconnected";
+const STALE_S = 30;    // a reading older than this is suspect
+const SILENT_S = 120;  // a station older than this counts as silent
+const MAX_SAMPLES = 240;
+const MAX_LOG = 60;
+
+const METRICS = [
+  { key: "temperature", label: "Temperature", unit: "°C", decimals: 1, axis: "left" },
+  { key: "humidity", label: "Humidity", unit: "% RH", decimals: 0, axis: "right" },
+];
+
+const state = {
+  selected: null,
+  nodes: new Map(),
+  samples: new Map(),
+  health: null,
+  wsOpen: false,
+  chatHistory: [],
+  chatLoading: false,
+};
+
+/* ---------- helpers ---------- */
+
+const ageSeconds = (ts) => Math.max(0, (Date.now() - Date.parse(ts)) / 1000);
+
+function ageText(sec) {
+  if (!Number.isFinite(sec)) return "—";
+  if (sec < 3) return "just now";
+  if (sec < 90) return `${Math.round(sec)} s ago`;
+  const m = Math.floor(sec / 60);
+  if (m < 60) return `${m} min ${Math.round(sec % 60)} s ago`;
+  return `${Math.floor(m / 60)} h ${m % 60} min ago`;
 }
 
-function renderMessageLog() {
-  const messages = Array.from(messageLogEl.children);
-  if (messages.length > 8) {
-    messages.slice(0, messages.length - 8).forEach((item) => item.remove());
+function stationState(sec) {
+  if (!Number.isFinite(sec)) return "stale";
+  if (sec <= STALE_S) return "live";
+  if (sec <= SILENT_S) return "warning";
+  return "stale";
+}
+
+function fmtClock(ts, withSeconds = true) {
+  const d = new Date(ts);
+  const p = (n) => String(n).padStart(2, "0");
+  const hm = `${p(d.getHours())}:${p(d.getMinutes())}`;
+  return withSeconds ? `${hm}:${p(d.getSeconds())}` : hm;
+}
+
+function token(name, fallback) {
+  const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  return v || fallback;
+}
+
+function rssiLevel(dbm) {
+  if (!Number.isFinite(dbm)) return 0;
+  if (dbm > -55) return 4;
+  if (dbm > -70) return 3;
+  if (dbm > -82) return 2;
+  return 1;
+}
+
+function pushLog(kind, nodeId, text) {
+  if (els.logEmpty && els.logEmpty.isConnected) els.logEmpty.remove();
+  const li = document.createElement("li");
+  if (kind === "dropped") li.dataset.kind = "dropped";
+  li.innerHTML = `<b>${nodeId}</b><span>${new Date().toLocaleTimeString()} · ${text}</span>`;
+  els.eventLog.prepend(li);
+  while (els.eventLog.children.length > MAX_LOG) els.eventLog.lastChild.remove();
+}
+
+/* ---------- status pills + banner ---------- */
+
+function setPill(pill, kind, label) {
+  pill.dataset.state = kind;
+  pill.querySelector("[data-value]").textContent = label;
+}
+
+function renderStatus() {
+  if (!state.wsOpen) setPill(els.wsPill, "stale", "disconnected");
+  else setPill(els.wsPill, "live", "connected");
+
+  const h = state.health;
+  if (!h) setPill(els.gwPill, "warning", "checking…");
+  else if (h.gatewayConnected) setPill(els.gwPill, "live", "connected");
+  else setPill(els.gwPill, "stale", "offline");
+
+  let text = null;
+  if (!state.wsOpen) text = "Disconnected from the dashboard stream — retrying…";
+  else if (h && !h.gatewayConnected) {
+    text = `Mesh gateway offline${h.gatewayMessage ? ` — ${h.gatewayMessage}` : ""}`;
+  }
+  if (!text) {
+    els.banner.hidden = true;
+    return;
+  }
+  els.banner.hidden = false;
+  els.banner.dataset.kind = state.wsOpen ? "warning" : "stale";
+  els.bannerText.textContent = text;
+}
+
+/* ---------- stations / nodes ---------- */
+
+function upsertNode(node) {
+  if (!node || !node.nodeId) return;
+  state.nodes.set(node.nodeId, { ...(state.nodes.get(node.nodeId) || {}), ...node });
+}
+
+function nodeSnapshot(id) {
+  const node = state.nodes.get(id);
+  const samples = state.samples.get(id) || [];
+  return { node, samples, last: samples[samples.length - 1] };
+}
+
+function renderRoster() {
+  const nodes = [...state.nodes.values()].sort((a, b) => a.nodeId.localeCompare(b.nodeId));
+  els.railCount.textContent = String(nodes.length);
+  if (els.railEmpty.isConnected) els.railEmpty.style.display = nodes.length ? "none" : "";
+  els.stationList.querySelectorAll(".station-row").forEach((el) => el.remove());
+
+  for (const node of nodes) {
+    const age = ageSeconds(node.timestamp);
+    const st = stationState(age);
+    const hasRssi = node.rssi !== null && node.rssi !== undefined && Number.isFinite(Number(node.rssi));
+    const rssi = hasRssi ? Number(node.rssi) : NaN;
+    const bat = Number(node.batteryLevel);
+
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "station-row";
+    const srcText = node.rssiSourceNodeId ? ` via ${node.rssiSourceNodeId}` : "";
+    row.title = `${node.nodeId} — ${st}${srcText}`;
+    row.dataset.selected = String(node.nodeId === state.selected);
+    row.setAttribute("aria-pressed", row.dataset.selected);
+    row.innerHTML = `
+      <span class="station-id">${node.nodeId}</span>
+      <span class="station-meta">
+        <span class="sig-bars" data-level="${hasRssi ? rssiLevel(rssi) : 0}">
+          <i class="sig-bar"></i><i class="sig-bar"></i><i class="sig-bar"></i><i class="sig-bar"></i>
+        </span>
+        <span>${hasRssi ? `${rssi} dBm` : "RSSI UNAVAILABLE"}</span>
+        ${Number.isInteger(node.hops) ? `<span>${node.hops}h</span>` : ""}
+        <span>bat ${Number.isFinite(bat) ? `${Math.round(bat)}%` : "—"}</span>
+      </span>
+      <span class="station-age" data-state="${st}">${ageText(age)}</span>`;
+    row.addEventListener("click", () => selectStation(node.nodeId));
+    els.stationList.appendChild(row);
   }
 }
 
-function pushLog(message) {
-  const item = document.createElement("li");
-  item.textContent = message;
-  messageLogEl.prepend(item);
-  renderMessageLog();
+function metricCards(values, node) {
+  const payload = (node && node.payload) || {};
+  const cards = [];
+  const units = (node && node.units) || {};
+
+  // Check known metrics first
+  for (const m of METRICS) {
+    const v = payload[m.key];
+    if (!Number.isFinite(Number(v))) continue;
+    cards.push({ label: m.label, unit: units[m.key] || m.unit, decimals: m.decimals, value: Number(v) });
+  }
+
+  // Generic numeric keys from payload beyond the known pair
+  for (const [k, v] of Object.entries(payload)) {
+    if (METRICS.some((m) => m.key === k) || !Number.isFinite(Number(v)) || cards.length >= 4) continue;
+    cards.push({ label: k, unit: units[k] || "", decimals: 1, value: Number(v) });
+  }
+
+  // Authoritative signal metric: "LAST-HOP RSSI"
+  const hasRssi = node && node.rssi !== null && node.rssi !== undefined && Number.isFinite(Number(node.rssi));
+  if (hasRssi) {
+    const subParts = [];
+    if (node.rssiSourceNodeId) subParts.push(`via ${node.rssiSourceNodeId}`);
+    if (Number.isInteger(node.hops)) subParts.push(`${node.hops} hop${node.hops === 1 ? "" : "s"}`);
+    cards.push({
+      label: "LAST-HOP RSSI",
+      unit: "dBm",
+      decimals: 0,
+      value: Number(node.rssi),
+      sub: subParts.join(" · "),
+    });
+  } else {
+    cards.push({
+      label: "LAST-HOP RSSI",
+      unit: "",
+      decimals: 0,
+      value: NaN,
+      text: "RSSI UNAVAILABLE",
+    });
+  }
+
+  const bat = node ? Number(node.batteryLevel) : NaN;
+  if (cards.length < 4 && Number.isFinite(bat)) {
+    cards.push({ label: "Battery", unit: "%", decimals: 0, value: bat });
+  }
+  return cards;
 }
 
-function renderCurrentNode() {
-  if (!state.lastEvent || !state.lastEvent.payload) {
-    nodeIdEl.textContent = "--";
-    temperatureEl.textContent = "--";
-    humidityEl.textContent = "--";
-    sequenceEl.textContent = "--";
-    updatedAtEl.textContent = "Waiting for data";
+function renderMetrics() {
+  if (!state.selected) {
+    els.metricGrid.innerHTML =
+      "<p class='empty-note'>no telemetry yet — waiting for the first station report</p>";
     return;
   }
 
-  const { nodeId, timestamp, sequence, payload } = state.lastEvent;
-  nodeIdEl.textContent = nodeId || "--";
-  temperatureEl.textContent = payload.temperature != null ? `${payload.temperature.toFixed(1)} °C` : "--";
-  humidityEl.textContent = payload.humidity != null ? `${payload.humidity.toFixed(0)} %` : "--";
-  sequenceEl.textContent = sequence ?? "--";
-  updatedAtEl.textContent = new Date(timestamp).toLocaleString();
+  const { node, last } = nodeSnapshot(state.selected);
+  const payload = (node && node.payload) || last || {};
+  const ts = (last && last.timestamp) || (node && node.timestamp);
+  const age = ts ? ageSeconds(ts) : NaN;
+  const st = stationState(age);
+
+  const cards = metricCards(payload, node);
+  if (!cards.length) {
+    els.metricGrid.innerHTML =
+      `<p class='empty-note'>${state.selected} has not reported any numeric readings yet.</p>`;
+    return;
+  }
+
+  const ageLine = (t) =>
+    t ? `${fmtClock(t)} · ${st === "stale" ? "not reporting, last seen " + ageText(age) : ageText(age)}` : "no data";
+
+  const cell = (c, primary) => {
+    const valHtml = c.text
+      ? `<h2 class="metric-value text-val">${c.text}</h2>`
+      : `<h2 class="metric-value">${Number.isFinite(c.value) ? c.value.toFixed(c.decimals) : "--"}</h2>`;
+    const subHtml = c.sub ? `<span class="metric-sub">${c.sub}</span>` : "";
+    return `
+    <div class="${primary ? "metric-primary" : "metric-cell"}" data-stale="${st === "stale"}">
+      <div class="metric-head">
+        <span class="metric-label">${c.label}</span>
+        <span class="tag" data-state="${st}">${st.toUpperCase()}</span>
+      </div>
+      <div class="metric-value-row">
+        ${valHtml}
+        ${c.unit ? `<span class="metric-unit">${c.unit}</span>` : ""}
+      </div>
+      ${subHtml}
+      <span class="metric-age">${ageLine(ts)}</span>
+    </div>`;
+  };
+
+  const [head, ...tail] = cards;
+  els.metricGrid.innerHTML =
+    (head ? cell(head, true) : "") +
+    tail.map((c) => cell(c, false)).join("");
 }
+
+function renderHealth() {
+  const counts = { live: 0, warning: 0, stale: 0 };
+  for (const n of state.nodes.values()) counts[stationState(ageSeconds(n.timestamp))] += 1;
+  const total = state.nodes.size;
+
+  if (!total) {
+    els.headline.innerHTML = "Waiting for stations…";
+    delete els.headline.dataset.tone;
+  } else {
+    const degraded = counts.warning;
+    const silent = counts.stale;
+    els.headline.dataset.tone = silent ? "stale" : degraded ? "warning" : "live";
+    els.headline.innerHTML =
+      `<b>${counts.live}/${total}</b> stations reporting` +
+      (degraded ? ` · ${degraded} degraded` : "") +
+      (silent ? ` · ${silent} silent` : "");
+  }
+
+  const flex = (n) => `${total ? (n / total) * 100 : 0}%`;
+  els.segs.live.style.flexBasis = flex(counts.live);
+  els.segs.warn.style.flexBasis = flex(counts.warning);
+  els.segs.stale.style.flexBasis = flex(counts.stale);
+}
+
+/* ---------- chart ---------- */
+
+const cctx = els.chartCanvas.getContext("2d");
+
+function chartSize() {
+  const cssW = els.chartFrame.clientWidth;
+  const cssH = els.chartFrame.clientHeight;
+  const dpr = window.devicePixelRatio || 1;
+  const W = Math.max(1, Math.round(cssW * dpr));
+  const H = Math.max(1, Math.round(cssH * dpr));
+  if (els.chartCanvas.width !== W || els.chartCanvas.height !== H) {
+    els.chartCanvas.width = W;
+    els.chartCanvas.height = H;
+  }
+  cctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { w: cssW, h: cssH };
+}
+
+function niceTicks(min, max, n) {
+  const span = Math.max(1e-9, max - min);
+  const rawStep = span / n;
+  const mag = Math.pow(10, Math.floor(Math.log10(rawStep)));
+  const err = rawStep / mag;
+  const mult = err >= 7.5 ? 10 : err >= 3.5 ? 5 : err >= 1.5 ? 2 : 1;
+  const step = mag * mult;
+  const ticks = [];
+  for (let v = Math.floor(min / step) * step; v <= max + step / 2; v += step) ticks.push(v);
+  return ticks;
+}
+
+function medianInterval(samples) {
+  const ds = [];
+  for (let i = 1; i < samples.length; i++) ds.push(samples[i].__t - samples[i - 1].__t);
+  if (!ds.length) return 3000;
+  ds.sort((a, b) => a - b);
+  return ds[Math.floor(ds.length / 2)] || 3000;
+}
+
+function chartKeys(samples) {
+  const known = METRICS.filter((m) => samples.some((s) => Number.isFinite(s[m.key])));
+  if (known.length) return known;
+
+  const found = new Set();
+  const metaUnits = (state.nodes.get(state.selected) || {}).units || {};
+  for (const s of samples) {
+    for (const [k, v] of Object.entries(s)) {
+      if (!["__t", "timestamp", "sequence", "bootId", "rssi", "rssiSourceNodeId", "hops", "units"].includes(k) && Number.isFinite(v)) {
+        found.add(k);
+      }
+    }
+  }
+  return Array.from(found).slice(0, 2).map((k, idx) => ({
+    key: k,
+    label: k,
+    unit: metaUnits[k] || "",
+    decimals: 1,
+    axis: idx === 0 ? "left" : "right",
+  }));
+}
+
+const GAP_FACTOR = 3;
 
 function drawChart() {
-  const width = chartCanvas.width;
-  const height = chartCanvas.height;
-  ctx.clearRect(0, 0, width, height);
+  const { w, h } = chartSize();
+  cctx.clearRect(0, 0, w, h);
 
-  const padding = 30;
-  const chartLeft = padding;
-  const chartRight = width - padding;
-  const chartTop = padding;
-  const chartBottom = height - padding;
+  const samples = state.samples.get(state.selected) || [];
+  els.chartNode.textContent = state.selected || "station";
+  els.chartEmpty.style.display = samples.length ? "none" : "flex";
+  if (!samples.length) return;
 
-  ctx.strokeStyle = "rgba(158, 181, 202, 0.6)";
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  ctx.moveTo(chartLeft, chartTop);
-  ctx.lineTo(chartLeft, chartBottom);
-  ctx.lineTo(chartRight, chartBottom);
-  ctx.stroke();
+  const pad = { l: 46, r: 48, t: 22, b: 28 };
+  const lo = samples[0].__t;
+  const hi = samples[samples.length - 1].__t;
+  const span = Math.max(3000, hi - lo);
+  const pxPerT = (w - pad.l - pad.r) / span;
+  const tToX = (t) => pad.l + (t - lo) * pxPerT;
+  const med = medianInterval(samples);
 
-  if (!state.samples.length) {
-    ctx.fillStyle = "rgba(158, 181, 202, 0.8)";
-    ctx.font = "16px Segoe UI";
-    ctx.fillText("Waiting for telemetry", chartLeft + 10, chartTop + 25);
+  const grid = token("--line", "#2e3237");
+  const faint = token("--text-faint", "#6e6d64");
+  const seriesColors = [token("--color-series-temp", "#ffb454"), token("--color-series-humidity", "#a8a69b")];
+  const fontStack = token("--font-mono", "monospace");
+  cctx.font = "10px " + fontStack;
+  cctx.lineWidth = 1;
+
+  // baseline + x ticks
+  cctx.strokeStyle = grid;
+  cctx.beginPath();
+  cctx.moveTo(pad.l, h - pad.b);
+  cctx.lineTo(w - pad.r, h - pad.b);
+  cctx.stroke();
+  cctx.fillStyle = faint;
+  cctx.textAlign = "center";
+  const xCount = Math.min(6, Math.max(3, Math.floor((w - pad.l - pad.r) / 90)));
+  for (let i = 0; i <= xCount; i++) {
+    const t = lo + (span * i) / xCount;
+    cctx.fillText(fmtClock(t, span <= 3600000), tToX(t), h - pad.b + 16);
+  }
+
+  const keys = chartKeys(samples);
+
+  keys.forEach((m, ki) => {
+    const fs = samples.filter((s) => Number.isFinite(s[m.key]));
+    const vMax = Math.max(...fs.map((s) => s[m.key]));
+    const ticks = ki === 0 ? niceTicks(0, Math.max(vMax, 10) * 1.05, 4) : niceTicks(0, 100, 4);
+    const vmin = ticks[0];
+    const vmax = ticks[ticks.length - 1];
+    const vToY = (v) => h - pad.b - ((v - vmin) / Math.max(1e-9, vmax - vmin)) * (h - pad.t - pad.b);
+    const axX = ki === 0 ? pad.l : w - pad.r;
+
+    if (ki === 0) {
+      cctx.strokeStyle = token("--line-strong", "#4a4f55");
+      ticks.forEach((t) => {
+        const y = vToY(t);
+        cctx.beginPath();
+        cctx.moveTo(pad.l, y);
+        cctx.lineTo(w - pad.r, y);
+        cctx.stroke();
+      });
+    }
+
+    // axis ticks + unit label
+    cctx.fillStyle = faint;
+    cctx.strokeStyle = grid;
+    cctx.beginPath();
+    cctx.moveTo(axX, pad.t);
+    cctx.lineTo(axX, h - pad.b);
+    cctx.stroke();
+    ticks.forEach((t) => {
+      const y = vToY(t);
+      cctx.beginPath();
+      cctx.moveTo(axX - 2, y);
+      cctx.lineTo(axX + 2, y);
+      cctx.stroke();
+      cctx.textAlign = ki === 0 ? "right" : "left";
+      cctx.fillText(String(Number(t.toFixed(1))), ki === 0 ? axX - 6 : axX + 6, y + 3);
+    });
+    cctx.textAlign = ki === 0 ? "left" : "right";
+    cctx.fillText(
+      `${m.label}${m.unit ? ` (${m.unit})` : ""}`,
+      ki === 0 ? pad.l + 8 : w - pad.r - 8,
+      pad.t + 4
+    );
+
+    // series line, gaps where the reading is missing or time jumped
+    cctx.strokeStyle = seriesColors[ki] || seriesColors[0];
+    cctx.lineWidth = 1.75;
+    let pen = false;
+    for (let i = 0; i < samples.length; i++) {
+      const s = samples[i];
+      const v = s[m.key];
+      const prev = samples[i - 1];
+      const jumped = prev && s.__t - prev.__t > GAP_FACTOR * med;
+      if (!Number.isFinite(v)) {
+        pen = false;
+        continue;
+      }
+      const x = tToX(s.__t);
+      const y = vToY(v);
+      if (!pen || jumped) {
+        cctx.beginPath();
+        cctx.moveTo(x, y);
+        pen = true;
+      } else {
+        cctx.lineTo(x, y);
+        if (i === samples.length - 1) cctx.stroke();
+      }
+      const nxt = samples[i + 1];
+      const nxtMissing = !nxt || !Number.isFinite(nxt[m.key]) || (nxt && nxt.__t - s.__t > GAP_FACTOR * med);
+      if (pen && nxtMissing) {
+        cctx.stroke();
+        pen = false;
+      }
+    }
+    cctx.lineWidth = 1;
+  });
+  if (!keys.length) {
+    cctx.fillStyle = faint;
+    cctx.textAlign = "center";
+    cctx.fillText("no numeric readings in this window", (w - pad.l - pad.r) / 2 + pad.l, h / 2);
+  }
+}
+
+function renderChartTable(samples) {
+  const thead = els.chartTable.querySelector("thead tr");
+  const tbody = els.chartTable.querySelector("tbody");
+  const keys = chartKeys(samples);
+
+  if (thead) {
+    let headHtml = '<th scope="col">Time</th>';
+    if (keys.length) {
+      headHtml += keys.map((m) => `<th scope="col">${m.label}${m.unit ? ` (${m.unit})` : ""}</th>`).join("");
+    } else {
+      headHtml += '<th scope="col">Temperature</th><th scope="col">Humidity</th>';
+    }
+    thead.innerHTML = headHtml;
+  }
+
+  const rows = samples.slice(-10).reverse().map((s) => {
+    let cellsHtml = `<td>${fmtClock(s.timestamp)}</td>`;
+    if (keys.length) {
+      cellsHtml += keys
+        .map((m) => {
+          const v = s[m.key];
+          return `<td>${Number.isFinite(v) ? v.toFixed(m.decimals !== undefined ? m.decimals : 1) + (m.unit ? ` ${m.unit}` : "") : "not reporting"}</td>`;
+        })
+        .join("");
+    } else {
+      const t = s.temperature;
+      const hu = s.humidity;
+      cellsHtml += `<td>${Number.isFinite(t) ? t.toFixed(1) + " °C" : "not reporting"}</td><td>${Number.isFinite(hu) ? Math.round(hu).toFixed(0) + " % RH" : "not reporting"}</td>`;
+    }
+    return `<tr>${cellsHtml}</tr>`;
+  });
+  tbody.innerHTML = rows.join("");
+}
+
+const resizeObserver = new ResizeObserver(() => drawChart());
+resizeObserver.observe(els.chartFrame);
+
+/* ---------- automated insights ---------- */
+
+async function loadInsights(nodeId) {
+  if (!nodeId) {
+    els.insightsNode.textContent = "station";
+    els.insightsUpdatedAt.textContent = "—";
+    els.insightsContent.replaceChildren();
+    const p = document.createElement("p");
+    p.className = "empty-note";
+    p.textContent = "no station selected";
+    els.insightsContent.appendChild(p);
     return;
   }
 
-  const maxTemp = Math.max(...state.samples.map((sample) => sample.temperature ?? 0), 40);
-  const maxHumidity = Math.max(...state.samples.map((sample) => sample.humidity ?? 0), 100);
+  // Clear old-node insight content immediately on selection change
+  els.insightsNode.textContent = nodeId;
+  els.insightsUpdatedAt.textContent = "updating…";
+  els.insightsContent.replaceChildren();
 
-  const tempPoints = state.samples.map((sample, index) => {
-    const x = chartLeft + (index / Math.max(1, state.samples.length - 1)) * (chartRight - chartLeft);
-    const y = chartBottom - ((sample.temperature ?? 0) / maxTemp) * (chartBottom - chartTop);
-    return { x, y };
-  });
+  let parsed;
+  try {
+    const res = await fetch(`/nodes/${encodeURIComponent(nodeId)}/insights`);
+    if (!res.ok) throw new Error(String(res.status));
+    parsed = await res.json();
+  } catch {
+    if (state.selected !== nodeId) return;
+    els.insightsUpdatedAt.textContent = "unavailable";
+    const note = document.createElement("p");
+    note.className = "empty-note";
+    note.textContent = "Insights temporarily unavailable.";
+    els.insightsContent.replaceChildren(note);
+    return;
+  }
 
-  const humidityPoints = state.samples.map((sample, index) => {
-    const x = chartLeft + (index / Math.max(1, state.samples.length - 1)) * (chartRight - chartLeft);
-    const y = chartBottom - ((sample.humidity ?? 0) / maxHumidity) * (chartBottom - chartTop);
-    return { x, y };
-  });
+  if (state.selected !== nodeId) return;
 
-  ctx.strokeStyle = "#42d1b8";
-  ctx.beginPath();
-  tempPoints.forEach((point, idx) => {
-    if (idx === 0) {
-      ctx.moveTo(point.x, point.y);
-    } else {
-      ctx.lineTo(point.x, point.y);
+  els.insightsUpdatedAt.textContent = fmtClock(parsed.generatedAt || new Date().toISOString());
+
+  const count = Number(parsed.sampleCount) || 0;
+  const insights = Array.isArray(parsed.insights) ? parsed.insights : [];
+
+  // Check if there are any numeric sensor samples in local history
+  const historySamples = state.samples.get(nodeId) || [];
+  let hasNumericSensorSample = false;
+  for (const s of historySamples) {
+    for (const [k, v] of Object.entries(s)) {
+      if (!["__t", "timestamp", "sequence", "bootId", "rssi", "rssiSourceNodeId", "hops", "units"].includes(k) && Number.isFinite(v)) {
+        hasNumericSensorSample = true;
+        break;
+      }
     }
-  });
-  ctx.stroke();
+    if (hasNumericSensorSample) break;
+  }
 
-  ctx.strokeStyle = "#6ea8ff";
-  ctx.beginPath();
-  humidityPoints.forEach((point, idx) => {
-    if (idx === 0) {
-      ctx.moveTo(point.x, point.y);
-    } else {
-      ctx.lineTo(point.x, point.y);
+  if (count === 0 || (!hasNumericSensorSample && count >= 20 && insights.length === 0)) {
+    const note = document.createElement("p");
+    note.className = "empty-note";
+    note.textContent = "No numeric sensor history available.";
+    els.insightsContent.replaceChildren(note);
+    return;
+  }
+
+  if (count < 20) {
+    const note = document.createElement("p");
+    note.className = "empty-note";
+    note.textContent = `Collecting baseline: ${count}/20 valid samples.`;
+    els.insightsContent.replaceChildren(note);
+    return;
+  }
+
+  if (insights.length === 0) {
+    const note = document.createElement("p");
+    note.className = "empty-note";
+    note.textContent = "All metrics within normal range; trends steady.";
+    els.insightsContent.replaceChildren(note);
+    return;
+  }
+
+  els.insightsContent.replaceChildren();
+  for (const item of insights) {
+    const row = document.createElement("div");
+    row.className = "insight-row";
+    row.dataset.kind = item.kind || "trend";
+
+    const tag = document.createElement("span");
+    tag.className = "insight-tag";
+    tag.textContent = (item.kind || "insight").toUpperCase();
+
+    const msg = document.createElement("span");
+    msg.className = "insight-text";
+    // Crucial requirement: insert returned message text with textContent, not innerHTML
+    msg.textContent = item.message || "";
+
+    row.appendChild(tag);
+    row.appendChild(msg);
+    els.insightsContent.appendChild(row);
+  }
+}
+
+let insightDebounceTimer = null;
+function scheduleInsightsUpdate(nodeId) {
+  if (state.selected !== nodeId) return;
+  clearTimeout(insightDebounceTimer);
+  insightDebounceTimer = setTimeout(() => {
+    if (state.selected === nodeId) {
+      loadInsights(nodeId);
     }
-  });
-  ctx.stroke();
+  }, 1000);
+}
 
-  ctx.fillStyle = "rgba(158, 181, 202, 0.8)";
-  ctx.font = "12px Segoe UI";
-  ctx.fillText("Temp", chartRight - 38, chartTop + 10);
-  ctx.fillText("Humidity", chartRight - 58, chartTop + 26);
+/* ---------- stations switching + history ---------- */
+
+function applyStation() {
+  renderRoster();
+  renderMetrics();
+  const cached = state.samples.get(state.selected) || [];
+  drawChart();
+  renderChartTable(cached);
+
+  const { node, last } = nodeSnapshot(state.selected);
+  const seq = (node && node.sequence !== undefined && node.sequence !== null)
+    ? node.sequence
+    : (last && last.sequence);
+  els.chartSeq.textContent = Number.isInteger(seq) ? `SEQ ${seq}` : "";
+}
+
+function selectStation(id) {
+  if (state.selected === id) return;
+  state.selected = id;
+
+  // Clear old-node insight content immediately on selection change
+  els.insightsContent.replaceChildren();
+  els.insightsNode.textContent = id;
+  els.insightsUpdatedAt.textContent = "updating…";
+
+  applyStation();
+  const cached = state.samples.get(id);
+  if (!cached || cached.length < 2) loadHistory(id);
+  loadInsights(id);
+  pushLog("info", id, "selected");
 }
 
 async function loadHistory(nodeId) {
-  const response = await fetch(`/nodes/${encodeURIComponent(nodeId)}/history?limit=50`);
-  const data = await response.json();
-  state.samples = (data.samples || []).map((sample) => ({
-    temperature: sample.temperature ?? null,
-    humidity: sample.humidity ?? null,
-    timestamp: sample.timestamp,
-    sequence: sample.sequence,
-  }));
-  drawChart();
-}
-
-async function loadNodes() {
-  const response = await fetch("/nodes");
-  const data = await response.json();
-  const nodes = data.nodes || [];
-
-  if (!nodes.length) {
-    state.lastEvent = null;
-    renderCurrentNode();
-    drawChart();
+  let parsed;
+  try {
+    const res = await fetch(`/nodes/${encodeURIComponent(nodeId)}/history?limit=200`);
+    if (!res.ok) throw new Error(String(res.status));
+    parsed = await res.json();
+  } catch {
+    pushLog("dropped", nodeId, "history request failed");
     return;
   }
+  const raw = Array.isArray(parsed && parsed.samples) ? parsed.samples : [];
+  const samples = raw
+    .map((s) => {
+      const obj = {
+        __t: Date.parse(s.timestamp),
+        timestamp: s.timestamp,
+        sequence: s.sequence,
+        bootId: s.bootId,
+        rssi: s.rssi,
+        rssiSourceNodeId: s.rssiSourceNodeId,
+        hops: s.hops,
+        units: s.units,
+      };
+      for (const [k, v] of Object.entries(s)) {
+        if (!["__t", "timestamp", "sequence", "bootId", "rssi", "rssiSourceNodeId", "hops", "units"].includes(k)) {
+          const num = Number(v);
+          if (Number.isFinite(num)) obj[k] = num;
+        }
+      }
+      return obj;
+    })
+    .filter((s) => Number.isFinite(s.__t))
+    .sort((a, b) => a.__t - b.__t);
 
-  const node = nodes[0];
-  state.nodeId = node.nodeId;
-  state.lastEvent = node;
-  renderCurrentNode();
-  await loadHistory(node.nodeId);
+  state.samples.set(nodeId, samples);
+  if (state.selected === nodeId) {
+    applyStation();
+    loadInsights(nodeId);
+  }
+}
+
+async function refreshNodes() {
+  let parsed;
+  try {
+    const res = await fetch("/nodes");
+    if (!res.ok) throw new Error(String(res.status));
+    parsed = await res.json();
+  } catch {
+    return;
+  }
+  (Array.isArray(parsed.nodes) ? parsed.nodes : []).forEach((n) => upsertNode(n));
+  renderRoster();
+  renderHealth();
+  if (!state.selected && parsed.nodes.length) {
+    state.selected = parsed.nodes[0].nodeId;
+    applyStation();
+    loadHistory(state.selected);
+    loadInsights(state.selected);
+  } else if (state.selected && state.nodes.has(state.selected)) {
+    renderMetrics();
+  }
 }
 
 async function refreshHealth() {
-  const response = await fetch("/health");
-  const data = await response.json();
-  setStatus(Boolean(data.gatewayConnected));
-  if (!data.gatewayConnected) {
-    pushLog(data.gatewayMessage || "Gateway offline");
+  try {
+    const res = await fetch("/health");
+    state.health = await res.json();
+  } catch {
+    return;
   }
+  renderStatus();
 }
 
-function setupSocket() {
-  const socketUrl = `${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.host}/live`;
-  const socket = new WebSocket(socketUrl);
+function refreshNow() {
+  refreshHealth();
+  refreshNodes();
+}
+
+/* ---------- websocket ---------- */
+
+let retryTimer = null;
+
+function connectSocket() {
+  const scheme = location.protocol === "https:" ? "wss" : "ws";
+  const socket = new WebSocket(`${scheme}://${location.host}/live`);
 
   socket.addEventListener("open", () => {
-    setStatus(true);
-    pushLog("Connected to live telemetry stream");
+    state.wsOpen = true;
+    renderStatus();
+    pushLog("info", "system", "dashboard stream connected");
+    refreshNow();
   });
 
-  socket.addEventListener("message", (event) => {
-    const message = JSON.parse(event.data);
-    if (message.type === "status") {
-      setStatus(Boolean(message.gatewayConnected));
+  socket.addEventListener("message", (ev) => {
+    let msg;
+    try {
+      msg = JSON.parse(ev.data);
+    } catch {
       return;
     }
-
-    if (message.type !== "telemetry") {
+    if (msg.type === "status" && typeof msg.gatewayConnected === "boolean") {
+      state.health = { ...(state.health || {}), gatewayConnected: msg.gatewayConnected };
+      renderStatus();
       return;
     }
-
-    state.lastEvent = message;
-    state.samples.push({
-      temperature: message.payload.temperature ?? null,
-      humidity: message.payload.humidity ?? null,
-      timestamp: message.timestamp,
-      sequence: message.sequence,
-    });
-
-    if (state.samples.length > 60) {
-      state.samples = state.samples.slice(-60);
-    }
-
-    renderCurrentNode();
-    drawChart();
-    pushLog(`${message.nodeId} @ ${new Date(message.timestamp).toLocaleTimeString()} | ${message.payload.temperature ?? "--"}°C / ${message.payload.humidity ?? "--"}%`);
+    if (msg.type === "telemetry" && msg.nodeId) onTelemetry(msg);
   });
 
   socket.addEventListener("close", () => {
-    setStatus(false);
-    pushLog("WebSocket disconnected; retrying...");
-    setTimeout(setupSocket, 2000);
+    state.wsOpen = false;
+    renderStatus();
+    clearTimeout(retryTimer);
+    retryTimer = setTimeout(connectSocket, 2000);
   });
 }
 
-async function initialize() {
-  await refreshHealth();
-  await loadNodes();
-  setupSocket();
+function onTelemetry(msg) {
+  upsertNode({
+    nodeId: msg.nodeId,
+    timestamp: msg.timestamp,
+    sequence: msg.sequence,
+    payload: msg.payload,
+    units: msg.units,
+    rssi: msg.rssi,
+    rssiSourceNodeId: msg.rssiSourceNodeId,
+    hops: msg.hops,
+    bootId: msg.bootId,
+    batteryLevel: msg.batteryLevel,
+    role: msg.role,
+  });
+
+  const arr = state.samples.get(msg.nodeId) || [];
+  const s = {
+    __t: Date.parse(msg.timestamp),
+    timestamp: msg.timestamp,
+    sequence: msg.sequence,
+    bootId: msg.bootId,
+    rssi: msg.rssi,
+    rssiSourceNodeId: msg.rssiSourceNodeId,
+    hops: msg.hops,
+    units: msg.units,
+  };
+  for (const [k, v] of Object.entries(msg.payload || {})) {
+    const n = Number(v);
+    if (Number.isFinite(n)) s[k] = n;
+  }
+  arr.push(s);
+  if (arr.length > MAX_SAMPLES) arr.splice(0, arr.length - MAX_SAMPLES);
+  state.samples.set(msg.nodeId, arr);
+
+  renderRoster();
+  renderHealth();
+  if (!state.selected) {
+    state.selected = msg.nodeId;
+    applyStation();
+    loadInsights(state.selected);
+  } else if (msg.nodeId === state.selected) {
+    applyStation();
+    els.updatedAt.textContent = `${fmtClock(msg.timestamp)} · ${ageText(ageSeconds(msg.timestamp))}`;
+    scheduleInsightsUpdate(msg.nodeId);
+  } else {
+    renderMetrics();
+  }
+
+  const seqPrefix = Number.isInteger(msg.sequence) ? `SEQ ${msg.sequence} · ` : "";
+  const bootPrefix = msg.bootId ? `[boot ${msg.bootId}] · ` : "";
+  const summary =
+    Object.entries(msg.payload || {})
+      .map(([k, v]) => `${k} ${Number.isFinite(Number(v)) ? Number(v) : v}`)
+      .join(" · ") || "telemetry received";
+
+  pushLog("info", msg.nodeId, `${seqPrefix}${bootPrefix}${summary}`);
 }
 
-initialize();
+/* periodic refresh */
+setInterval(() => {
+  renderRoster();
+  renderMetrics();
+}, 5000);
+setInterval(refreshHealth, 10000);
+setInterval(refreshNodes, 30000);
+setInterval(() => {
+  if (state.selected) {
+    loadInsights(state.selected);
+  }
+}, 30000);
+
+
+/* ---------- ai assistant chat ---------- */
+
+function appendChatMessage(role, text) {
+  if (!els.chatMessages) return;
+  const msg = document.createElement("div");
+  msg.className = `chat-msg chat-msg-${role}`;
+
+  const roleLabel = document.createElement("span");
+  roleLabel.className = "chat-role";
+  roleLabel.textContent = role === "user" ? "[USER]" : "[AI]";
+
+  const textSpan = document.createElement("span");
+  textSpan.className = "chat-text";
+  textSpan.textContent = text;
+
+  msg.appendChild(roleLabel);
+  msg.appendChild(textSpan);
+  els.chatMessages.appendChild(msg);
+  els.chatMessages.scrollTop = els.chatMessages.scrollHeight;
+  return msg;
+}
+
+async function checkAiStatus() {
+  try {
+    const res = await fetch("/api/ai/status");
+    if (!res.ok) return;
+    const data = await res.json();
+    if (els.aiModelTag) {
+      if (data.configured && data.model) {
+        els.aiModelTag.textContent = data.model.toUpperCase();
+        els.aiModelTag.dataset.state = "live";
+      } else {
+        els.aiModelTag.textContent = "OFFLINE";
+        els.aiModelTag.dataset.state = "stale";
+      }
+    }
+  } catch {
+    if (els.aiModelTag) {
+      els.aiModelTag.textContent = "OFFLINE";
+      els.aiModelTag.dataset.state = "stale";
+    }
+  }
+}
+
+async function sendChatMessage(promptText) {
+  const text = (promptText !== undefined ? promptText : els.chatInput?.value || "").trim();
+  if (!text || state.chatLoading) return;
+
+  if (els.chatInput) els.chatInput.value = "";
+  state.chatLoading = true;
+  if (els.chatSendBtn) els.chatSendBtn.disabled = true;
+  if (els.chatInput) els.chatInput.disabled = true;
+
+  appendChatMessage("user", text);
+  state.chatHistory.push({ role: "user", content: text });
+
+  const pendingMsg = appendChatMessage("assistant", "thinking…");
+
+  try {
+    const res = await fetch("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        message: text,
+        nodeId: state.selected || null,
+        history: state.chatHistory.slice(0, -1).slice(-8),
+      }),
+    });
+
+    const data = await res.json();
+    if (pendingMsg && pendingMsg.isConnected) pendingMsg.remove();
+
+    const reply = data.reply || (data.error ? "Error: " + data.reply : "No response from AI.");
+    appendChatMessage("assistant", reply);
+    state.chatHistory.push({ role: "assistant", content: reply });
+
+    if (data.model && els.aiModelTag) {
+      els.aiModelTag.textContent = data.model.toUpperCase();
+      els.aiModelTag.dataset.state = "live";
+    }
+  } catch (err) {
+    if (pendingMsg && pendingMsg.isConnected) pendingMsg.remove();
+    appendChatMessage("assistant", "Network error communicating with AI server.");
+  } finally {
+    state.chatLoading = false;
+    if (els.chatSendBtn) els.chatSendBtn.disabled = false;
+    if (els.chatInput) {
+      els.chatInput.disabled = false;
+      els.chatInput.focus();
+    }
+  }
+}
+
+function initChatEvents() {
+  if (els.chatForm) {
+    els.chatForm.addEventListener("submit", (e) => {
+      e.preventDefault();
+      sendChatMessage();
+    });
+  }
+
+  if (els.chatClearBtn) {
+    els.chatClearBtn.addEventListener("click", () => {
+      state.chatHistory = [];
+      if (els.chatMessages) {
+        els.chatMessages.replaceChildren();
+        appendChatMessage("assistant", "Chat history cleared. Ready for your questions.");
+      }
+    });
+  }
+
+  document.querySelectorAll(".quick-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const p = btn.getAttribute("data-prompt");
+      if (p) sendChatMessage(p);
+    });
+  });
+
+  checkAiStatus();
+}
+
+/* ---------- boot ---------- */
+
+refreshHealth().then(refreshNodes).then(() => {
+  applyStation();
+  drawChart();
+  initChatEvents();
+  connectSocket();
+});

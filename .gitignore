@@ -71,3 +71,5 @@ __pycache__/
 *.py[cod]
 .venv/
 Dashboard/.vscode/settings.json
+.env
+Dashboard/.env
